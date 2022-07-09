@@ -85,6 +85,49 @@ CompilerArtifacts = namedtuple(
 )
 
 
+class SuspendTracker():
+    fileTracker = None
+    
+    def __init__(self):
+        if not SuspendTracker.fileTracker:
+            if windll.kernel32.GetModuleHandleW("FileTracker.dll"):
+                SuspendTracker.fileTracker = windll.FileTracker
+            elif windll.kernel32.GetModuleHandleW("FileTracker32.dll"):
+                SuspendTracker.fileTracker = windll.FileTracker32
+            elif windll.kernel32.GetModuleHandleW("FileTracker64.dll"):
+                SuspendTracker.fileTracker = windll.FileTracker64
+
+    def __enter__(self):
+        SuspendTracker.suspend()
+
+    def __exit__(self, typ, value, traceback):
+        SuspendTracker.resume()
+
+    @staticmethod
+    def suspend():
+        if SuspendTracker.fileTracker:
+            SuspendTracker.fileTracker.SuspendTracking()
+
+    @staticmethod
+    def resume():
+        if SuspendTracker.fileTracker:
+            SuspendTracker.fileTracker.ResumeTracking()
+
+
+def isTrackerEnabled():
+    return 'TRACKER_ENABLED' in os.environ
+
+def untrackable(func):
+    if not isTrackerEnabled():
+        return func
+
+    def untrackedFunc(*args, **kwargs):
+        with SuspendTracker():
+            return func(*args, **kwargs)
+
+    return untrackedFunc
+
+
 def printBinary(stream, rawData):
     with OUTPUT_LOCK:
         stream.buffer.write(rawData)
@@ -189,6 +232,7 @@ class ManifestSection:
     def manifestFiles(self):
         return filesBeneath(self.manifestSectionDir)
 
+    @untrackable
     def setManifest(self, manifestHash, manifest):
         manifestPath = self.manifestPath(manifestHash)
         printTraceStatement(
@@ -197,12 +241,21 @@ class ManifestSection:
             )
         )
         ensureDirectoryExists(self.manifestSectionDir)
-        with atomic_write(manifestPath, overwrite=True) as outFile:
-            # Converting namedtuple to JSON via OrderedDict preserves key names and keys order
-            entries = [e._asdict() for e in manifest.entries()]
-            jsonobject = {"entries": entries}
-            json.dump(jsonobject, outFile, sort_keys=True, indent=2)
+        for attempt in range(5):
+            try:
+                with atomic_write(manifestPath, overwrite=True) as outFile:
+                    # Converting namedtuple to JSON via OrderedDict preserves key names and keys order
+                    entries = [e._asdict() for e in manifest.entries()]
+                    jsonobject = {"entries": entries}
+                    json.dump(jsonobject, outFile, sort_keys=True, indent=2)
+            except:
+                pass
+            else:
+                break
+        else:
+            printErrStr("clcache: atomic_write %s fail with exception" % self._fileName)
 
+    @untrackable
     def getManifest(self, manifestHash):
         fileName = self.manifestPath(manifestHash)
         if not os.path.exists(fileName):
@@ -219,9 +272,15 @@ class ManifestSection:
                     ]
                 )
         except IOError:
+            printErrStr("clcache: manifest file %s was broken" % fileName)
+            return None
+        except AttributeError:
+            printTraceStatement("clcache: manifest file %s has an attribute error" % fileName)
             return None
         except ValueError:
             printErrStr("clcache: manifest file %s was broken" % fileName)
+            return None
+        except:
             return None
 
 
@@ -427,8 +486,23 @@ class CompilerArtifactsSection:
                 os.path.join(tempEntryDir, CompilerArtifactsSection.STDERR_FILE),
                 artifacts.stderr,
             )
-        # Replace the full cache entry atomically
-        os.replace(tempEntryDir, cacheEntryDir)
+        
+        for attempt in range(3):
+            try:
+                # Replace the full cache entry atomically
+                os.replace(tempEntryDir, cacheEntryDir)
+            except:
+                pass
+        else:
+            # not important if it fails (can be created next time again)
+            try:
+                rmtree(tempEntryDir, ignore_errors=True)
+            except:
+                pass
+            
+            printTraceStatement("clcache: database entry %s creation failed" % cacheEntryDir)
+            pass
+
         return size
 
     def getEntry(self, key):
@@ -736,13 +810,25 @@ class PersistentJSONDict:
                 self._dict = json.load(f)
         except IOError:
             pass
+        except AttributeError:
+            printErrStr("clcache: persistent json file %s has an atttribute error" % fileName)
+            return None
         except ValueError:
             printErrStr("clcache: persistent json file %s was broken" % fileName)
 
     def save(self):
         if self._dirty:
-            with atomic_write(self._fileName, overwrite=True) as f:
-                json.dump(self._dict, f, sort_keys=True, indent=4)
+            # 3 retries only because it is just the stats file
+            for attempt in range(3):
+                try:
+                    with atomic_write(self._fileName, overwrite=True) as f:
+                        json.dump(self._dict, f, sort_keys=True, indent=4)
+                except:
+                    pass
+                else:
+                    break
+            else:
+                pass
 
     def __setitem__(self, key, value):
         self._dict[key] = value
@@ -823,6 +909,7 @@ class Statistics:
         self._stats = None
         self.lock = CacheLock.forPath(self._statsFile)
 
+    @untrackable
     def __enter__(self):
         self._stats = PersistentJSONDict(self._statsFile)
         for k in Statistics.RESETTABLE_KEYS | Statistics.NON_RESETTABLE_KEYS:
@@ -830,6 +917,7 @@ class Statistics:
                 self._stats[k] = 0
         return self
 
+    @untrackable
     def __exit__(self, typ, value, traceback):
         # Does not write to disc when unchanged
         self._stats.save()
@@ -1074,6 +1162,8 @@ def copyOrLink(srcFilePath, dstFilePath, writeCache=False):
             # links). This shouldn't be a problem though.
             os.utime(dstFilePath, None)
             return
+        else:
+            printTraceStatement("clcache: creating hardlink %s failed" % dstFilePath)
 
     # If hardlinking fails for some reason (or it's not enabled), just
     # fall back to moving bytes around. Always to a temporary path first to
@@ -1098,7 +1188,14 @@ def copyOrLink(srcFilePath, dstFilePath, writeCache=False):
                 copyfileobj(fileIn, fileOut)
     else:
         copyfile(srcFilePath, tempDst)
-    os.replace(tempDst, dstFilePath)
+    
+    for attempt in range(5):
+        try:
+            os.replace(tempDst, dstFilePath)
+        except:
+            pass
+    else:
+        raise Exception("clcache: object %s could not be copied to the destination" % dstFilePath) 
 
 
 def printTraceStatement(msg: str) -> None:
@@ -1791,9 +1888,11 @@ def scheduleJobs(
 
     exitCode = 0
     cleanupRequired = False
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=jobCount(cmdLine)
-    ) as executor:
+    
+    def poolExecutor(*args, **kwargs) -> concurrent.futures.Executor:
+        return concurrent.futures.ThreadPoolExecutor(*args, **kwargs)
+
+    with poolExecutor(max_workers=min(jobCount(cmdLine), len(objectFiles))) as executor:
         jobs = []
         for (srcFile, srcLanguage), objFile in zip(sourceFiles, objectFiles):
             jobCmdLine = baseCmdLine + [srcLanguage + srcFile]
