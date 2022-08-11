@@ -248,10 +248,9 @@ class ManifestSection:
                     entries = [e._asdict() for e in manifest.entries()]
                     jsonobject = {"entries": entries}
                     json.dump(jsonobject, outFile, sort_keys=True, indent=2)
+                break
             except:
                 pass
-            else:
-                break
         else:
             printErrStr("clcache: atomic_write %s fail with exception" % self._fileName)
 
@@ -491,6 +490,7 @@ class CompilerArtifactsSection:
             try:
                 # Replace the full cache entry atomically
                 os.replace(tempEntryDir, cacheEntryDir)
+                break
             except:
                 pass
         else:
@@ -823,10 +823,9 @@ class PersistentJSONDict:
                 try:
                     with atomic_write(self._fileName, overwrite=True) as f:
                         json.dump(self._dict, f, sort_keys=True, indent=4)
+                    break
                 except:
                     pass
-                else:
-                    break
             else:
                 pass
 
@@ -1192,10 +1191,11 @@ def copyOrLink(srcFilePath, dstFilePath, writeCache=False):
     for attempt in range(5):
         try:
             os.replace(tempDst, dstFilePath)
+            break
         except:
             pass
     else:
-        raise Exception("clcache: object %s could not be copied to the destination" % dstFilePath) 
+        raise Exception("clcache: object {0} could not be copied to the destination {1}".format(tempDst, dstFilePath)) 
 
 
 def printTraceStatement(msg: str) -> None:
@@ -1317,6 +1317,9 @@ def expandCommandLine(cmdline):
             ret.extend(
                 expandCommandLine(splitCommandsFile(includeFileContents.strip()))
             )
+        elif arg[1:] == "Zi" and "CLCACHE_REPLACEDEBUG" in os.environ:
+            # replace /Zi by /Z7
+            ret.append(arg[0] + "Z7")
         else:
             ret.append(arg)
 
@@ -1508,7 +1511,7 @@ class CommandLineAnalyzer:
 
         # Technically, it would be possible to support /Zi: we'd just need to
         # copy the generated .pdb files into/out of the cache.
-        if "Zi" in options:
+        if "Zi" in options and not "CLCACHE_REPLACEDEBUG" in os.environ:
             raise ExternalDebugInfoError()
 
         if "Yc" in options or "Yu" in options:
