@@ -18,6 +18,7 @@ Bugfixes (compared to the original project)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 - many multicore related problems fixed (repeated actions)
 - pull request #319 from original project partly merged to ensure that incremental builds will work (https://github.com/frerich/clcache/pull/319)
+- possibility added to exchange /Zi with /Z7 internally (set CLCACHE_REPLACEDEBUG to anything you want within your environment)
 
 
 Installation
